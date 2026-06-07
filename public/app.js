@@ -111,6 +111,7 @@ document.addEventListener('DOMContentLoaded', () => {
                     progressContainer.classList.add('hidden');
                     resultContainer.classList.remove('hidden');
                     fileUrlInput.value = response.url;
+                    if (typeof fetchStats === 'function') fetchStats();
                 } catch(e) {
                     showError('Invalid server response');
                 }
@@ -137,4 +138,48 @@ document.addEventListener('DOMContentLoaded', () => {
         errorMessage.textContent = msg;
         errorMessage.classList.remove('hidden');
     }
+
+    // Storage Stats Logic
+    const storageStatsContainer = document.getElementById('storage-stats');
+    const storageUsedEl = document.getElementById('storage-used');
+    const storageLimitEl = document.getElementById('storage-limit');
+    const storageBarFillEl = document.getElementById('storage-bar');
+
+    function formatBytes(bytes) {
+        if (bytes === 0) return '0 Bytes';
+        const k = 1024;
+        const sizes = ['Bytes', 'KB', 'MB', 'GB', 'TB'];
+        const i = Math.floor(Math.log(bytes) / Math.log(k));
+        return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+    }
+
+    function fetchStats() {
+        fetch('/api/stats')
+            .then(res => res.json())
+            .then(data => {
+                const used = data.totalSize;
+                const limit = data.limit;
+                
+                storageUsedEl.textContent = formatBytes(used);
+                storageLimitEl.textContent = formatBytes(limit);
+                
+                let percent = (used / limit) * 100;
+                if (percent > 100) percent = 100;
+                
+                storageBarFillEl.style.width = percent + '%';
+                
+                // Change color if approaching limit
+                if (percent > 90) {
+                    storageBarFillEl.style.background = 'linear-gradient(90deg, #f39c12, #e74c3c)';
+                } else {
+                    storageBarFillEl.style.background = 'linear-gradient(90deg, #3498db, #2ecc71)';
+                }
+                
+                storageStatsContainer.classList.remove('hidden');
+            })
+            .catch(err => console.error('Failed to fetch storage stats', err));
+    }
+
+    // Fetch initial stats
+    fetchStats();
 });

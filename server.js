@@ -266,6 +266,13 @@ app.post('/api/upload', uploadLimiter, upload.single('file'), async (req, res, n
   res.json({ url: fileUrl, fileId, filename: safeFilename });
 });
 
+app.get('/api/stats', (req, res) => {
+  res.json({
+    totalSize: storageState.totalSize,
+    limit: STORAGE_LIMIT_BYTES
+  });
+});
+
 app.get('/:uuid/:filename', downloadLimiter, (req, res) => {
   const uuid = req.params.uuid;
   
