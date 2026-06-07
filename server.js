@@ -15,7 +15,21 @@ const PORT = process.env.PORT || 3000;
 const STORAGE_LIMIT_BYTES = (parseFloat(process.env.STORAGE_LIMIT_GB) || 5) * 1024 * 1024 * 1024;
 const UPLOADS_DIR = path.join(__dirname, 'uploads');
 
+class StorageLimitError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'StorageLimitError';
+  }
+}
+
 const storageMutex = new Mutex();
+
+// In-memory storage state to avoid O(n) directory walks on every upload
+const storageState = {
+  totalSize: 0,
+  allFiles: [],
+  initialized: false
+};
 
 if (!fs.existsSync(UPLOADS_DIR)) {
   fs.mkdirSync(UPLOADS_DIR, { recursive: true });
@@ -48,8 +62,10 @@ app.use(limiter);
 // Serve static frontend
 app.use(express.static(path.join(__dirname, 'public')));
 
-// Calculate storage stats
-async function getStorageStats(dirPath) {
+// Calculate storage stats ONCE at startup
+async function initStorageStats() {
+  if (storageState.initialized) return;
+  
   let totalSize = 0;
   let allFiles = [];
 
@@ -72,27 +88,39 @@ async function getStorageStats(dirPath) {
     }
   }
 
-  if (fs.existsSync(dirPath)) {
-    await walkDir(dirPath);
+  if (fs.existsSync(UPLOADS_DIR)) {
+    await walkDir(UPLOADS_DIR);
   }
-  return { totalSize, allFiles };
+  
+  // Sort oldest first
+  allFiles.sort((a, b) => a.mtime - b.mtime);
+  
+  storageState.totalSize = totalSize;
+  storageState.allFiles = allFiles;
+  storageState.initialized = true;
 }
 
-// Ensure space sequentially using mutex
+// Ensure space sequentially using mutex and running cache
 async function ensureSpace(newFileSize) {
   return await storageMutex.runExclusive(async () => {
-    let { totalSize, allFiles } = await getStorageStats(UPLOADS_DIR);
-    
-    // Sort oldest first
-    allFiles.sort((a, b) => a.mtime - b.mtime);
+    if (!storageState.initialized) {
+      await initStorageStats();
+    }
     
     let i = 0;
-    while (totalSize + newFileSize > STORAGE_LIMIT_BYTES && i < allFiles.length) {
-      const fileToRemove = allFiles[i];
+    while (storageState.totalSize + newFileSize > STORAGE_LIMIT_BYTES && i < storageState.allFiles.length) {
+      const fileToRemove = storageState.allFiles[i];
       try {
         await fs.promises.unlink(fileToRemove.path);
-        totalSize -= fileToRemove.size;
-        console.log(`Deleted old file to free space: ${fileToRemove.path}`);
+        storageState.totalSize -= fileToRemove.size;
+        
+        console.log(JSON.stringify({
+          event: 'delete',
+          filename: path.basename(fileToRemove.path),
+          size: fileToRemove.size,
+          timestamp: new Date().toISOString(),
+          reason: 'storage_pressure'
+        }));
         
         // Cleanup empty parent dir
         const parentFiles = await fs.promises.readdir(fileToRemove.dir);
@@ -105,8 +133,13 @@ async function ensureSpace(newFileSize) {
       i++;
     }
     
-    if (totalSize + newFileSize > STORAGE_LIMIT_BYTES) {
-      throw new Error('Storage limit reached and cannot be freed');
+    // Remove deleted files from array
+    if (i > 0) {
+      storageState.allFiles.splice(0, i);
+    }
+    
+    if (storageState.totalSize + newFileSize > STORAGE_LIMIT_BYTES) {
+      throw new StorageLimitError('Storage limit reached and cannot be freed');
     }
   });
 }
@@ -114,8 +147,10 @@ async function ensureSpace(newFileSize) {
 const storage = multer.diskStorage({
   destination: async (req, file, cb) => {
     try {
-      // Conservative estimate based on headers. Multer limits will enforce max bounds.
-      const estimatedSize = parseInt(req.headers['content-length'] || '0', 10);
+      // Prevent Content-Length spoofing by capping the estimated size
+      const rawSize = parseInt(req.headers['content-length'] || '0', 10);
+      const estimatedSize = Math.min(rawSize, STORAGE_LIMIT_BYTES);
+      
       await ensureSpace(estimatedSize);
       
       const fileId = uuidv4();
@@ -143,13 +178,40 @@ const upload = multer({
 });
 
 // Upload Endpoint
-app.post('/api/upload', upload.single('file'), (req, res) => {
+app.post('/api/upload', upload.single('file'), async (req, res) => {
   if (!req.file) {
     return res.status(400).json({ error: 'No file uploaded' });
   }
   
   const fileId = req.fileId;
   const safeFilename = path.basename(req.file.originalname);
+  
+  // Track the actual file stored in the running cache
+  const fullPath = path.join(UPLOADS_DIR, fileId, safeFilename);
+  try {
+    const stats = await fs.promises.stat(fullPath);
+    await storageMutex.runExclusive(() => {
+      storageState.totalSize += stats.size;
+      storageState.allFiles.push({
+        path: fullPath,
+        dir: path.join(UPLOADS_DIR, fileId),
+        size: stats.size,
+        mtime: stats.mtimeMs
+      });
+    });
+  } catch (err) {
+    console.error("Error updating cache for new file", err);
+  }
+
+  // Audit Log
+  console.log(JSON.stringify({
+    event: 'upload',
+    ip: req.ip,
+    filename: safeFilename,
+    fileId: fileId,
+    size: req.file.size,
+    timestamp: new Date().toISOString()
+  }));
   
   // Construct direct URL correctly using secure trust proxy logic
   const fileUrl = `${req.protocol}://${req.get('host')}/${fileId}/${encodeURIComponent(safeFilename)}`;
@@ -177,13 +239,14 @@ app.get('/:uuid/:filename', (req, res) => {
   if (fs.existsSync(filePath)) {
     res.download(filePath, safeFilename);
   } else {
-    res.status(404).send('File not found or has been deleted to free space.');
+    // Generic error message to prevent info disclosure
+    res.status(404).send('File not found.');
   }
 });
 
 // Error handling middleware
 app.use((err, req, res, next) => {
-  if (err.message && err.message.includes('Storage limit reached')) {
+  if (err instanceof StorageLimitError) {
     return res.status(507).json({ error: 'Storage limit reached. Cannot free enough space.' });
   }
   if (err.code === 'LIMIT_FILE_SIZE') {
@@ -193,6 +256,14 @@ app.use((err, req, res, next) => {
   res.status(500).json({ error: 'Internal server error' });
 });
 
-app.listen(PORT, () => {
-  console.log(`Server listening on port ${PORT}`);
+// Pre-initialize cache
+initStorageStats().then(() => {
+  app.listen(PORT, () => {
+    console.log(`Server listening on port ${PORT}`);
+  });
+}).catch(err => {
+  console.error("Failed to initialize storage stats", err);
+  process.exit(1);
 });
+
+module.exports = app; // export for testing
