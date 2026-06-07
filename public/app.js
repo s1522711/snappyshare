@@ -68,7 +68,9 @@ document.addEventListener('DOMContentLoaded', () => {
 
     copyBtn.addEventListener('click', () => {
         fileUrlInput.select();
-        document.execCommand('copy');
+        navigator.clipboard.writeText(fileUrlInput.value).catch(err => {
+            console.error('Failed to copy: ', err);
+        });
         
         // Visual feedback
         const originalHTML = copyBtn.innerHTML;
