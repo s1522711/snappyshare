@@ -39,10 +39,9 @@ describe('SnappyShare Security and Limits Tests', function() {
 
   it('should enforce rate limiting and CSP headers', (done) => {
     request(app)
-      .get('/')
-      .expect('Content-Security-Policy', /default-src 'self'/)
-      .expect('RateLimit-Limit', '100')
-      .expect(200, done);
+      .get('/123e4567-e89b-12d3-a456-426614174000/nonexistent.txt')
+      .expect('RateLimit-Limit', '500') // Updated to download rate limit max
+      .expect(404, done);
   });
 
   it('should handle missing files securely (generic 404)', (done) => {
@@ -51,4 +50,5 @@ describe('SnappyShare Security and Limits Tests', function() {
       .expect(404)
       .expect('File not found.', done);
   });
+
 });

@@ -26,10 +26,22 @@ The application is designed to be self-hosted and features automatic storage man
    ```
 
 3. **Configuration**:
-   The application uses a `.env` file for configuration. By default, it sets a storage limit of 5 GB. If you want to change it, create or edit the `.env` file in the root directory:
+   The application uses a `.env` file for configuration. Create or edit the `.env` file in the root directory:
    ```env
+   # The port the server will listen on (default: 3000)
+   PORT=3247
+
+   # Total maximum storage capacity in Gigabytes before old files are auto-deleted (default: 5)
    STORAGE_LIMIT_GB=5
-   PORT=3000
+
+   # Maximum allowed size for a single file upload in Gigabytes (default: 1)
+   MAX_FILE_SIZE_GB=1
+
+   # Set to "true" if running behind a reverse proxy (like Nginx) to correctly resolve client IP addresses
+   TRUST_PROXY=true
+
+   # The base URL used for generating download links (optional, falls back to the Host header if omitted)
+   BASE_URL=https://yourdomain.com
    ```
 
 ## Usage

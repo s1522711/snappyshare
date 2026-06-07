@@ -6,13 +6,20 @@ const path = require('path');
 const dotenv = require('dotenv');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
-const { Mutex } = require('async-mutex');
+const { Mutex, withTimeout } = require('async-mutex');
 
 dotenv.config();
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const STORAGE_LIMIT_BYTES = (parseFloat(process.env.STORAGE_LIMIT_GB) || 5) * 1024 * 1024 * 1024;
+
+// Config Validation (L-06, L-07)
+const storageLimitGb = Math.max(0.1, parseFloat(process.env.STORAGE_LIMIT_GB) || 5);
+const STORAGE_LIMIT_BYTES = storageLimitGb * 1024 * 1024 * 1024;
+
+const maxFileSizeGb = Math.max(0.001, parseFloat(process.env.MAX_FILE_SIZE_GB) || 1);
+const MAX_FILE_SIZE_BYTES = maxFileSizeGb * 1024 * 1024 * 1024;
+
 const UPLOADS_DIR = path.join(__dirname, 'uploads');
 
 class StorageLimitError extends Error {
@@ -22,9 +29,9 @@ class StorageLimitError extends Error {
   }
 }
 
-const storageMutex = new Mutex();
+// Mutex Timeout (M-01)
+const storageMutex = withTimeout(new Mutex(), 10000, new Error('Mutex timeout'));
 
-// In-memory storage state to avoid O(n) directory walks on every upload
 const storageState = {
   totalSize: 0,
   allFiles: [],
@@ -35,8 +42,8 @@ if (!fs.existsSync(UPLOADS_DIR)) {
   fs.mkdirSync(UPLOADS_DIR, { recursive: true });
 }
 
-// Trust reverse proxies (e.g. Nginx) to properly set req.protocol and req.ip
-app.set('trust proxy', 1);
+// Trust proxy Opt-in (M-04)
+app.set('trust proxy', process.env.TRUST_PROXY === 'true' ? 1 : false);
 
 // Security Headers
 app.use(helmet({
@@ -50,19 +57,25 @@ app.use(helmet({
   },
 }));
 
-// Rate Limiting
-const limiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 100, // Limit each IP to 100 requests per window
+// Split Rate Limiting (M-05)
+const uploadLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 100,
   standardHeaders: true,
   legacyHeaders: false,
 });
-app.use(limiter);
 
-// Serve static frontend
-app.use(express.static(path.join(__dirname, 'public')));
+const downloadLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 500,
+  standardHeaders: true,
+  legacyHeaders: false,
+});
 
-// Calculate storage stats ONCE at startup
+// Dotfile Ignore (I-04)
+app.use(express.static(path.join(__dirname, 'public'), { dotfiles: 'ignore' }));
+
+// Initialize Stats
 async function initStorageStats() {
   if (storageState.initialized) return;
   
@@ -92,16 +105,14 @@ async function initStorageStats() {
     await walkDir(UPLOADS_DIR);
   }
   
-  // Sort oldest first
   allFiles.sort((a, b) => a.mtime - b.mtime);
-  
   storageState.totalSize = totalSize;
   storageState.allFiles = allFiles;
   storageState.initialized = true;
 }
 
-// Ensure space sequentially using mutex and running cache
-async function ensureSpace(newFileSize) {
+// Atomic Space Reservation (H-01)
+async function reserveSpace(newFileSize) {
   return await storageMutex.runExclusive(async () => {
     if (!storageState.initialized) {
       await initStorageStats();
@@ -122,7 +133,6 @@ async function ensureSpace(newFileSize) {
           reason: 'storage_pressure'
         }));
         
-        // Cleanup empty parent dir
         const parentFiles = await fs.promises.readdir(fileToRemove.dir);
         if (parentFiles.length === 0) {
           await fs.promises.rmdir(fileToRemove.dir);
@@ -133,7 +143,6 @@ async function ensureSpace(newFileSize) {
       i++;
     }
     
-    // Remove deleted files from array
     if (i > 0) {
       storageState.allFiles.splice(0, i);
     }
@@ -141,57 +150,95 @@ async function ensureSpace(newFileSize) {
     if (storageState.totalSize + newFileSize > STORAGE_LIMIT_BYTES) {
       throw new StorageLimitError('Storage limit reached and cannot be freed');
     }
+    
+    // Reserve space atomically before write
+    storageState.totalSize += newFileSize;
   });
+}
+
+function sanitizeFilename(originalName) {
+  let safe = originalName || '';
+  if (!safe) throw new Error('Filename is empty');
+  if (safe.includes('\0')) throw new Error('Invalid filename (contains null byte)');
+  
+  // Normalize backslashes (L-03)
+  safe = safe.replace(/\\/g, '/');
+  
+  // Normalize unicode to NFC, get basename, slice to 255 chars (L-01, L-05)
+  safe = path.basename(safe).normalize('NFC').slice(0, 255);
+  
+  if (!safe) throw new Error('Filename is empty after sanitization');
+  return safe;
 }
 
 const storage = multer.diskStorage({
   destination: async (req, file, cb) => {
     try {
-      // Prevent Content-Length spoofing by capping the estimated size
-      const rawSize = parseInt(req.headers['content-length'] || '0', 10);
-      const estimatedSize = Math.min(rawSize, STORAGE_LIMIT_BYTES);
+      const rawLength = parseInt(req.headers['content-length'] || '0', 10);
       
-      await ensureSpace(estimatedSize);
+      // Fix NaN/Negative bypass (C-01, C-02)
+      if (!Number.isFinite(rawLength) || rawLength < 0) {
+        return cb(new Error('Invalid Content-Length'));
+      }
+      
+      const estimatedSize = Math.min(rawLength, STORAGE_LIMIT_BYTES);
+      
+      // Atomic reservation (H-01)
+      await reserveSpace(estimatedSize);
+      req.estimatedSize = estimatedSize; // Save for reconciliation
       
       const fileId = uuidv4();
       const destPath = path.join(UPLOADS_DIR, fileId);
       fs.mkdirSync(destPath, { recursive: true });
       req.fileId = fileId;
+      
       cb(null, destPath);
     } catch (err) {
       cb(err);
     }
   },
   filename: (req, file, cb) => {
-    // Sanitize filename to prevent directory traversal
-    const safeFilename = path.basename(file.originalname);
-    cb(null, safeFilename);
+    try {
+      const safeFilename = sanitizeFilename(file.originalname);
+      cb(null, safeFilename);
+    } catch (err) {
+      cb(err);
+    }
   }
 });
 
-// Configure Multer with max file size limit to prevent abuse
+// Multer Limits (M-07, L-07)
 const upload = multer({
   storage,
   limits: {
-    fileSize: STORAGE_LIMIT_BYTES // Absolute maximum single file size bounds
+    fileSize: MAX_FILE_SIZE_BYTES,
+    fieldSize: 1024,      // 1KB max per non-file field
+    fields: 5,            // max 5 non-file fields
+    parts: 10,            // max 10 parts total
   }
 });
 
-// Upload Endpoint
-app.post('/api/upload', upload.single('file'), async (req, res) => {
+app.post('/api/upload', uploadLimiter, upload.single('file'), async (req, res, next) => {
   if (!req.file) {
+    // Rollback reservation if no file was uploaded but reservation was somehow made
+    if (req.estimatedSize) {
+      await storageMutex.runExclusive(() => { storageState.totalSize -= req.estimatedSize; });
+    }
     return res.status(400).json({ error: 'No file uploaded' });
   }
   
   const fileId = req.fileId;
-  const safeFilename = path.basename(req.file.originalname);
-  
-  // Track the actual file stored in the running cache
+  const safeFilename = sanitizeFilename(req.file.originalname);
   const fullPath = path.join(UPLOADS_DIR, fileId, safeFilename);
+  
   try {
     const stats = await fs.promises.stat(fullPath);
+    
+    // Reconcile atomic space reservation
+    const difference = stats.size - req.estimatedSize;
+    
     await storageMutex.runExclusive(() => {
-      storageState.totalSize += stats.size;
+      storageState.totalSize += difference; // Correct the initial estimation
       storageState.allFiles.push({
         path: fullPath,
         dir: path.join(UPLOADS_DIR, fileId),
@@ -203,7 +250,6 @@ app.post('/api/upload', upload.single('file'), async (req, res) => {
     console.error("Error updating cache for new file", err);
   }
 
-  // Audit Log
   console.log(JSON.stringify({
     event: 'upload',
     ip: req.ip,
@@ -213,50 +259,71 @@ app.post('/api/upload', upload.single('file'), async (req, res) => {
     timestamp: new Date().toISOString()
   }));
   
-  // Construct direct URL correctly using secure trust proxy logic
-  const fileUrl = `${req.protocol}://${req.get('host')}/${fileId}/${encodeURIComponent(safeFilename)}`;
+  // Host Header Phishing prevention (H-03)
+  const BASE_URL = process.env.BASE_URL || `${req.protocol}://${req.get('host')}`;
+  const fileUrl = `${BASE_URL}/${fileId}/${encodeURIComponent(safeFilename)}`;
+  
   res.json({ url: fileUrl, fileId, filename: safeFilename });
 });
 
-// Serve File Route
-app.get('/:uuid/:filename', (req, res) => {
+app.get('/:uuid/:filename', downloadLimiter, (req, res) => {
   const uuid = req.params.uuid;
-  // Sanitize filename and strictly construct path inside UPLOADS_DIR
-  const safeFilename = path.basename(req.params.filename);
   
-  // Basic validation for uuid format to prevent unexpected behavior
   if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(uuid)) {
-    return res.status(400).send('Invalid file ID format.');
+    return res.status(400).send('Invalid request.');
   }
 
-  const filePath = path.join(UPLOADS_DIR, uuid, safeFilename);
-  
-  // Double-check path traversal just in case
-  if (!filePath.startsWith(UPLOADS_DIR)) {
-    return res.status(403).send('Forbidden');
-  }
-  
-  if (fs.existsSync(filePath)) {
-    res.download(filePath, safeFilename);
-  } else {
-    // Generic error message to prevent info disclosure
-    res.status(404).send('File not found.');
+  try {
+    const safeFilename = sanitizeFilename(req.params.filename);
+    const filePath = path.join(UPLOADS_DIR, uuid, safeFilename);
+    
+    if (!filePath.startsWith(UPLOADS_DIR)) {
+      return res.status(403).send('Forbidden');
+    }
+    
+    if (fs.existsSync(filePath)) {
+      res.download(filePath, safeFilename);
+    } else {
+      res.status(404).send('File not found.');
+    }
+  } catch (err) {
+    return res.status(400).send('Invalid request.');
   }
 });
 
 // Error handling middleware
-app.use((err, req, res, next) => {
+app.use(async (err, req, res, next) => {
+  // Empty Directory Cleanup (M-02) and Mutex Reservation Rollback
+  if (req.estimatedSize) {
+    try {
+      await storageMutex.runExclusive(() => {
+        storageState.totalSize -= req.estimatedSize;
+      });
+      if (req.fileId) {
+        const dirPath = path.join(UPLOADS_DIR, req.fileId);
+        if (fs.existsSync(dirPath)) {
+          fs.rmSync(dirPath, { recursive: true, force: true });
+        }
+      }
+    } catch (e) {
+      console.error('Error during cleanup rollback:', e);
+    }
+  }
+
   if (err instanceof StorageLimitError) {
     return res.status(507).json({ error: 'Storage limit reached. Cannot free enough space.' });
   }
   if (err.code === 'LIMIT_FILE_SIZE') {
     return res.status(413).json({ error: 'File is too large.' });
   }
+  if (err.message === 'Invalid Content-Length' || err.message.includes('Invalid filename')) {
+    return res.status(400).json({ error: err.message });
+  }
+  
   console.error(err);
   res.status(500).json({ error: 'Internal server error' });
 });
 
-// Pre-initialize cache
 initStorageStats().then(() => {
   app.listen(PORT, () => {
     console.log(`Server listening on port ${PORT}`);
@@ -266,4 +333,4 @@ initStorageStats().then(() => {
   process.exit(1);
 });
 
-module.exports = app; // export for testing
+module.exports = app;
